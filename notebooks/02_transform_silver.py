@@ -1,74 +1,86 @@
 # Databricks notebook source
-# MVP Brasileirão - 02 - Silver (tratamento + enriquecimento)
+# MVP Brasileirão - 02 - Bronze -> Silver (limpeza + padronização)
 
+# COMMAND ----------
+import re
 from pyspark.sql import functions as F
 
 # COMMAND ----------
-BRONZE_TABLE = "brasileirao_bronze.matches_raw"
-SILVER_DB = "brasileirao_silver"
-SILVER_TABLE = f"{SILVER_DB}.matches"
+CATALOG = "workspace"
+SCHEMA  = "default"
 
-spark.sql(f"CREATE DATABASE IF NOT EXISTS {SILVER_DB}")
+BRONZE_TABLE = f"{CATALOG}.{SCHEMA}.matches_bronze"
+SILVER_TABLE = f"{CATALOG}.{SCHEMA}.matches_silver"
+
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{SCHEMA}")
 
 # COMMAND ----------
 df = spark.table(BRONZE_TABLE)
 
-# Normalizar nomes de colunas comuns (caso o dataset venha com variações)
-# Aqui assumimos as colunas principais do CSV do Brasileirão.
-# Se alguma coluna não existir no seu CSV, o erro vai mostrar qual é — aí ajustamos rapidinho.
+# COMMAND ----------
+# ===== Função: normalizar nome de colunas para snake_case =====
+def snake(s: str) -> str:
+    s = s.strip()
+    s = re.sub(r"[^\w]+", "_", s, flags=re.UNICODE)
+    s = re.sub(r"__+", "_", s)
+    return s.lower().strip("_")
+
+new_cols = [snake(c) for c in df.columns]
+df = df.toDF(*new_cols)
 
 # COMMAND ----------
-# ===== Conversões e padronizações =====
-# - trim em strings
-# - placares e rodada para int
-# - data para DATE (dd/MM/yyyy)
-# - colunas derivadas de resultado e pontos
+# ===== Tipos e regras comuns (tentando detectar colunas existentes) =====
+cols = set(df.columns)
 
-df_silver = (
-    df
-    .withColumn("mandante", F.trim(F.col("mandante")))
-    .withColumn("visitante", F.trim(F.col("visitante")))
-    .withColumn("vencedor", F.trim(F.col("vencedor")))
-    .withColumn("arena", F.trim(F.col("arena")))
-    .withColumn("rodata", F.col("rodata").cast("int"))
-    .withColumn("mandante_Placar", F.col("mandante_Placar").cast("int"))
-    .withColumn("visitante_Placar", F.col("visitante_Placar").cast("int"))
-    .withColumn("match_date", F.to_date(F.col("data"), "dd/MM/yyyy"))
-    .withColumn("season_year", F.year(F.col("match_date")).cast("int"))
-    .withColumn("goal_diff", (F.col("mandante_Placar") - F.col("visitante_Placar")).cast("int"))
-)
+# datas: tenta achar coluna "data" (mais comum)
+if "data" in cols:
+    # tenta converter data (funciona com muitos formatos, e se falhar vira null)
+    df = df.withColumn("data_dt", F.to_date(F.col("data")))
+    # se ficar muito null, tenta dd/MM/yyyy também
+    null_ratio = df.filter(F.col("data_dt").isNull()).count() / max(df.count(), 1)
+    if null_ratio > 0.5:
+        df = df.withColumn("data_dt", F.to_date(F.col("data"), "dd/MM/yyyy"))
 
-# Resultado do mandante: W/D/L
-df_silver = df_silver.withColumn(
-    "result_home",
-    F.when(F.col("mandante_Placar") > F.col("visitante_Placar"), F.lit("W"))
-     .when(F.col("mandante_Placar") < F.col("visitante_Placar"), F.lit("L"))
-     .otherwise(F.lit("D"))
-)
+# placares
+for c in ["mandante_placar", "visitante_placar", "gols_mandante", "gols_visitante"]:
+    if c in cols:
+        df = df.withColumn(c, F.col(c).cast("int"))
 
-# Pontos
-df_silver = df_silver.withColumn(
-    "home_points",
-    F.when(F.col("result_home") == "W", F.lit(3))
-     .when(F.col("result_home") == "D", F.lit(1))
-     .otherwise(F.lit(0))
-).withColumn(
-    "away_points",
-    F.when(F.col("result_home") == "L", F.lit(3))
-     .when(F.col("result_home") == "D", F.lit(1))
-     .otherwise(F.lit(0))
-)
+# nomes de times padrão (remove espaços duplos)
+for c in ["mandante", "visitante", "vencedor"]:
+    if c in cols:
+        df = df.withColumn(c, F.trim(F.regexp_replace(F.col(c).cast("string"), r"\s+", " ")))
+
+# cria "temporada" se não existir (usa ano da data_dt)
+cols = set(df.columns)
+if "temporada" not in cols:
+    if "data_dt" in cols:
+        df = df.withColumn("temporada", F.year(F.col("data_dt")))
+    else:
+        df = df.withColumn("temporada", F.lit(None).cast("int"))
+
+# remove duplicados (se existir id, usa; senão usa combinação)
+cols = set(df.columns)
+if "id" in cols:
+    df = df.dropDuplicates(["id"])
+else:
+    keys = [c for c in ["temporada", "rodada", "mandante", "visitante", "data_dt"] if c in cols]
+    if keys:
+        df = df.dropDuplicates(keys)
+
+df = df.withColumn("_silver_ts", F.current_timestamp())
+
+# COMMAND ----------
+display(df.limit(10))
+print("Linhas silver:", df.count(), " | Colunas:", len(df.columns))
 
 # COMMAND ----------
 # ===== Gravar Silver =====
 (
-    df_silver
-    .write
-    .format("delta")
-    .mode("overwrite")
-    .saveAsTable(SILVER_TABLE)
+    df.write
+      .format("delta")
+      .mode("overwrite")
+      .saveAsTable(SILVER_TABLE)
 )
 
-print("Tabela Silver criada:", SILVER_TABLE)
-display(spark.sql(f"SELECT COUNT(*) AS rows FROM {SILVER_TABLE}"))
-display(spark.sql(f"SELECT * FROM {SILVER_TABLE} LIMIT 10"))
+print("OK -> Silver gravado:", SILVER_TABLE)
