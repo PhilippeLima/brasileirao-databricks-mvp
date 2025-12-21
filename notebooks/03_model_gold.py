@@ -1,97 +1,100 @@
 # Databricks notebook source
-# MVP Brasileirão - 03 - Gold (modelo estrela)
+# MVP Brasileirão - 03 - Silver -> Gold (métricas por time/temporada)
 
+# COMMAND ----------
 from pyspark.sql import functions as F
 
 # COMMAND ----------
-SILVER_TABLE = "brasileirao_silver.matches"
+CATALOG = "workspace"
+SCHEMA  = "default"
 
-GOLD_DB = "brasileirao_gold"
-DIM_TEAM = f"{GOLD_DB}.dim_team"
-DIM_DATE = f"{GOLD_DB}.dim_date"
-DIM_SEASON = f"{GOLD_DB}.dim_season"
-FACT_MATCH = f"{GOLD_DB}.fact_match"
+SILVER_TABLE = f"{CATALOG}.{SCHEMA}.matches_silver"
+GOLD_TABLE   = f"{CATALOG}.{SCHEMA}.team_season_gold"
 
-spark.sql(f"CREATE DATABASE IF NOT EXISTS {GOLD_DB}")
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{SCHEMA}")
 
+# COMMAND ----------
 df = spark.table(SILVER_TABLE)
+cols = set(df.columns)
+
+# valida colunas mínimas
+need = {"mandante", "visitante"}
+missing = [c for c in need if c not in cols]
+if missing:
+    raise Exception(f"Faltam colunas essenciais no Silver: {missing}")
+
+# tenta identificar placares
+home_score_col = "mandante_placar" if "mandante_placar" in cols else ("gols_mandante" if "gols_mandante" in cols else None)
+away_score_col = "visitante_placar" if "visitante_placar" in cols else ("gols_visitante" if "gols_visitante" in cols else None)
+
+if home_score_col is None or away_score_col is None:
+    raise Exception("Não encontrei colunas de placar (mandante_placar/visitante_placar ou gols_mandante/gols_visitante).")
+
+# temporada
+season_col = "temporada" if "temporada" in cols else None
+if season_col is None:
+    raise Exception("Não encontrei coluna 'temporada' no Silver.")
+
+# cria resultado por partida (mandante x visitante)
+df2 = df.withColumn("home_goals", F.col(home_score_col).cast("int")) \
+        .withColumn("away_goals", F.col(away_score_col).cast("int")) \
+        .withColumn("resultado",
+                    F.when(F.col("home_goals") > F.col("away_goals"), F.lit("H"))
+                     .when(F.col("home_goals") < F.col("away_goals"), F.lit("A"))
+                     .otherwise(F.lit("D"))
+                   )
 
 # COMMAND ----------
-# ===== Dimensão Time =====
-teams = (
-    df.select(F.col("mandante").alias("team_name"))
-    .union(df.select(F.col("visitante").alias("team_name")))
-    .where(F.col("team_name").isNotNull() & (F.col("team_name") != ""))
-    .distinct()
+# ===== Tabela "long" por time (uma linha para mandante + uma para visitante) =====
+home = df2.select(
+    F.col(season_col).alias("temporada"),
+    F.col("mandante").alias("time"),
+    F.lit(1).alias("jogos"),
+    F.when(F.col("resultado") == "H", 1).otherwise(0).alias("vitorias"),
+    F.when(F.col("resultado") == "D", 1).otherwise(0).alias("empates"),
+    F.when(F.col("resultado") == "A", 1).otherwise(0).alias("derrotas"),
+    F.col("home_goals").alias("gols_pro"),
+    F.col("away_goals").alias("gols_contra")
 )
 
-dim_team = teams.withColumn(
-    "team_sk",
-    F.sha2(F.lower(F.col("team_name")), 256)
-).select("team_sk", "team_name")
-
-dim_team.write.format("delta").mode("overwrite").saveAsTable(DIM_TEAM)
-print("Criado:", DIM_TEAM, "linhas:", dim_team.count())
-
-# COMMAND ----------
-# ===== Dimensão Data =====
-dim_date = (
-    df.select("match_date")
-    .where(F.col("match_date").isNotNull())
-    .distinct()
-    .withColumn("date_sk", F.date_format(F.col("match_date"), "yyyyMMdd").cast("int"))
-    .withColumn("year", F.year("match_date").cast("int"))
-    .withColumn("month", F.month("match_date").cast("int"))
-    .withColumn("day", F.dayofmonth("match_date").cast("int"))
-    .withColumn("dow", F.date_format("match_date", "E"))
-    .select("date_sk", "match_date", "year", "month", "day", "dow")
+away = df2.select(
+    F.col(season_col).alias("temporada"),
+    F.col("visitante").alias("time"),
+    F.lit(1).alias("jogos"),
+    F.when(F.col("resultado") == "A", 1).otherwise(0).alias("vitorias"),
+    F.when(F.col("resultado") == "D", 1).otherwise(0).alias("empates"),
+    F.when(F.col("resultado") == "H", 1).otherwise(0).alias("derrotas"),
+    F.col("away_goals").alias("gols_pro"),
+    F.col("home_goals").alias("gols_contra")
 )
 
-dim_date.write.format("delta").mode("overwrite").saveAsTable(DIM_DATE)
-print("Criado:", DIM_DATE, "linhas:", dim_date.count())
+long_df = home.unionByName(away)
 
-# COMMAND ----------
-# ===== Dimensão Temporada =====
-dim_season = (
-    df.select("season_year")
-    .where(F.col("season_year").isNotNull())
-    .distinct()
-    .withColumnRenamed("season_year", "season_sk")
-    .withColumn("season_year", F.col("season_sk"))
-    .select("season_sk", "season_year")
+gold = (long_df
+        .groupBy("temporada", "time")
+        .agg(
+            F.sum("jogos").alias("jogos"),
+            F.sum("vitorias").alias("vitorias"),
+            F.sum("empates").alias("empates"),
+            F.sum("derrotas").alias("derrotas"),
+            F.sum("gols_pro").alias("gols_pro"),
+            F.sum("gols_contra").alias("gols_contra")
+        )
+        .withColumn("saldo_gols", F.col("gols_pro") - F.col("gols_contra"))
+        .withColumn("pontos", F.col("vitorias")*3 + F.col("empates"))
+        .withColumn("_gold_ts", F.current_timestamp())
 )
 
-dim_season.write.format("delta").mode("overwrite").saveAsTable(DIM_SEASON)
-print("Criado:", DIM_SEASON, "linhas:", dim_season.count())
+# COMMAND ----------
+display(gold.orderBy(F.desc("temporada"), F.desc("pontos")).limit(30))
 
 # COMMAND ----------
-# ===== Fato Partida =====
-fact = (
-    df
-    .withColumn("home_team_sk", F.sha2(F.lower(F.col("mandante")), 256))
-    .withColumn("away_team_sk", F.sha2(F.lower(F.col("visitante")), 256))
-    .withColumn("date_sk", F.date_format(F.col("match_date"), "yyyyMMdd").cast("int"))
-    .withColumn("season_sk", F.col("season_year"))
-    .select(
-        F.col("ID").cast("bigint").alias("match_id"),
-        "season_sk", "date_sk",
-        "home_team_sk", "away_team_sk",
-        F.col("rodata").cast("int").alias("round"),
-        F.col("arena").alias("stadium"),
-        F.col("mandante_Placar").cast("int").alias("home_goals"),
-        F.col("visitante_Placar").cast("int").alias("away_goals"),
-        F.col("goal_diff").cast("int"),
-        F.col("result_home"),
-        F.col("home_points").cast("int"),
-        F.col("away_points").cast("int"),
-        F.col("vencedor").alias("winner_raw"),
-    )
+# ===== Gravar Gold =====
+(
+    gold.write
+        .format("delta")
+        .mode("overwrite")
+        .saveAsTable(GOLD_TABLE)
 )
 
-fact.write.format("delta").mode("overwrite").saveAsTable(FACT_MATCH)
-print("Criado:", FACT_MATCH, "linhas:", fact.count())
-
-# COMMAND ----------
-# Visualização rápida
-display(spark.sql(f"SHOW TABLES IN {GOLD_DB}"))
-display(spark.sql(f"SELECT * FROM {FACT_MATCH} LIMIT 10"))
+print("OK -> Gold gravado:", GOLD_TABLE)
